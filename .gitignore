@@ -1,0 +1,22 @@
+.venv/
+node_modules/
+frontend/dist/
+var/
+__pycache__/
+.pytest_cache/
+.DS_Store
+*.pyc
+*.tsbuildinfo
+
+# Local credentials and private runtime artifacts
+.env
+.env.*
+!.env.example
+secrets/
+*.token
+*.pem
+*.key
+*.pt
+*.pth
+*.sqlite3*
+*.log
