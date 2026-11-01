@@ -80,6 +80,20 @@ class Publish(BaseModel):
     stop_loss: float = Field(.006, ge=0, le=.5)
 
 
+class MACDStrategy(BaseModel):
+    name: str = Field('MACD 规则策略', min_length=1, max_length=100)
+    dataset_id: str
+    fast: int = Field(12, ge=2, le=500)
+    slow: int = Field(26, ge=3, le=1000)
+    signal: int = Field(9, ge=2, le=500)
+    stop_loss: float = Field(0, ge=0, le=.5)
+
+    @model_validator(mode='after')
+    def periods(self):
+        if self.fast >= self.slow: raise ValueError('快线周期必须小于慢线周期')
+        return self
+
+
 class ExecutionConfig(BaseModel):
     dataset_id: str
     strategy_id: str | None = None

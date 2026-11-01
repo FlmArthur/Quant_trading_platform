@@ -13,12 +13,13 @@ import time
 import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 from fastapi import FastAPI, File, Form, UploadFile, Request, Header
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, SecretStr
 from . import store,data
-from .schemas import ExperimentConfig,Acquisition,Publish,ExecutionConfig
+from .schemas import ExperimentConfig,Acquisition,Publish,ExecutionConfig,MACDStrategy
 
 LOCK=threading.RLock();PROCESSES={};PREDICTORS={};STOP=threading.Event()
 
@@ -40,6 +41,14 @@ def scheduler():
         PROCESSES.pop(id,None)
 
 
+def forecast_scheduler():
+    from trading.auto_forecast import effective_schedule,is_due,run_once
+    while not STOP.wait(10):
+        settings=global_forecast_schedule()
+        run_once([config for config in store.listing('forecast_schedule') if is_due(effective_schedule(config,settings))])
+        if STOP.wait(20):break
+
+
 @asynccontextmanager
 async def lifespan(app):
     data.bootstrap()
@@ -48,6 +57,7 @@ async def lifespan(app):
         if r['status'] in ['RUNNING','PAUSED']:
             store.update(r['id'],status='INTERRUPTED',command=None,error='服务重启，可从检查点继续')
     STOP.clear();thread=threading.Thread(target=scheduler,daemon=True);thread.start()
+    threading.Thread(target=forecast_scheduler,daemon=True).start()
     yield
     STOP.set()
     for id,p in list(PROCESSES.items()):
@@ -110,7 +120,7 @@ def configure_provider(body:ProviderToken):
 @app.get('/api/v1/trash')
 def trash():
     return [dict(id=r['id'],kind=kind,name=r.get('name') or r.get('config',{}).get('name') or ('模拟会话 · ' if kind=='session' else '回测 · ')+r.get('created_at',r['id']),deleted_at=r['deleted_at'])
-        for kind in ['dataset','experiment','strategy','backtest','session'] for r in store.listing(kind,include_deleted=True) if r.get('deleted_at')]
+        for kind in ['dataset','experiment','strategy','backtest','session','forecast'] for r in store.listing(kind,include_deleted=True) if r.get('deleted_at')]
 
 
 @app.post('/api/v1/trash/{id}/restore')
@@ -366,8 +376,134 @@ def explain(id:str,body:Explain):
     return view
 
 
+class ForecastRequest(BaseModel):
+    dataset_id:str
+    strategy_ids:list[str]=Field(min_length=1,max_length=20)
+
+
+@app.post('/api/v1/forecasts')
+def create_forecasts(body:ForecastRequest):
+    from trading.forecast import save_forecast
+    results=[];errors=[]
+    for strategy_id in dict.fromkeys(body.strategy_ids):
+        try:
+            with LOCK: results.append(save_forecast(body.dataset_id,strategy_id))
+        except (ValueError,OSError) as e: errors.append(dict(strategy_id=strategy_id,message=str(e)))
+    return dict(results=results,errors=errors)
+
+
+@app.get('/api/v1/forecasts')
+def forecasts():
+    from trading.forecast import with_outcome
+    datasets=sorted(store.listing('dataset'),key=lambda d:(d['end'],d['created_at']),reverse=True)
+    return [with_outcome(r,datasets) for r in store.listing('forecast')[:200]]
+
+
+class ForecastSchedule(BaseModel):
+    strategy_id:str
+    enabled:bool=True
+    schedule_mode:Literal['interval','daily']|None=None
+    interval_minutes:int|None=Field(None,ge=1,le=1440)
+    fixed_time:str|None=Field(None,pattern=r'^(?:[01][0-9]|2[0-3]):[0-5][0-9]$')
+    use_global:bool|None=None
+
+
+@app.delete('/api/v1/forecasts/{id}')
+def delete_forecast(id:str):return soft_delete(id,'forecast')
+
+
+class GlobalForecastSchedule(BaseModel):
+    schedule_mode:Literal['interval','daily']='interval'
+    interval_minutes:int=Field(5,ge=1,le=1440)
+    fixed_time:str=Field('15:35',pattern=r'^(?:[01][0-9]|2[0-3]):[0-5][0-9]$')
+
+
+@app.get('/api/v1/forecast-schedule-settings')
+def global_forecast_schedule():
+    from trading.auto_forecast import DEFAULT_SCHEDULE
+    saved=store.listing('forecast_settings')
+    return {**DEFAULT_SCHEDULE,**(saved[0] if saved else {})}
+
+
+@app.post('/api/v1/forecast-schedule-settings')
+def save_global_forecast_schedule(body:GlobalForecastSchedule):
+    from trading.auto_forecast import uses_global
+    values=body.model_dump();existing=store.listing('forecast_settings')
+    if existing:
+        old=existing[0]
+        changed=any(old.get(key)!=value for key,value in values.items())
+        result=store.update(old['id'],**values)
+    else:
+        changed=True
+        result=store.put('forecast_settings',dict(id=store.uid('forecast_settings_'),**values,created_at=store.now()))
+    if changed:
+        for plan in store.listing('forecast_schedule'):
+            if uses_global(plan):store.update(plan['id'],last_checked=None,last_error=None)
+    return result
+
+
+@app.get('/api/v1/forecast-schedules')
+def forecast_schedules():return store.listing('forecast_schedule')
+
+
+@app.post('/api/v1/forecast-schedules')
+def forecast_schedule(body:ForecastSchedule):
+    strategy=store.get(body.strategy_id,'strategy')
+    if strategy.get('deleted_at') or strategy['frequency']!='1d':raise ValueError('请选择未删除的日线策略')
+    existing=next((s for s in store.listing('forecast_schedule') if s['strategy_id']==body.strategy_id),None)
+    from trading.auto_forecast import uses_global
+    prior_global=uses_global(existing) if existing else True
+    use_global=body.use_global if body.use_global is not None else (False if body.schedule_mode is not None else prior_global)
+    settings=dict(schedule_mode=body.schedule_mode or (existing or {}).get('schedule_mode','interval'),
+        interval_minutes=body.interval_minutes or (existing or {}).get('interval_minutes',5),
+        fixed_time=body.fixed_time or (existing or {}).get('fixed_time','15:35'))
+    if existing:
+        changed=any(existing.get(k,default)!=v for (k,v),default in zip(settings.items(),('interval',5,'15:35')))
+        changes=dict(enabled=body.enabled,use_global=use_global,**settings)
+        if changed or prior_global!=use_global or (body.enabled and not existing.get('enabled')):changes.update(last_checked=None,last_error=None)
+        return store.update(existing['id'],**changes)
+    return store.put('forecast_schedule',dict(id=store.uid('fs_'),strategy_id=body.strategy_id,
+        symbol=strategy['symbol'],enabled=body.enabled,use_global=use_global,last_error=None,created_at=store.now(),**settings))
+
+
 @app.get('/api/v1/strategies')
 def strategies():return store.listing('strategy')
+
+
+class DowStrategy(BaseModel):
+    name:str=Field('道氏理论 · 双指数月线',min_length=1,max_length=100)
+    dataset_id:str
+    sh_dataset_id:str
+    sz_dataset_id:str
+
+
+@app.post('/api/v1/strategies/dow')
+def create_dow(p:DowStrategy):
+    refs=[]
+    for id in [p.dataset_id,p.sh_dataset_id,p.sz_dataset_id]:
+        frame,meta=data.load(id)
+        if meta.get('deleted_at') or meta['frequency']!='1d':raise ValueError('请选择未删除的日线数据')
+        refs.append(meta)
+    target,sh,sz=refs
+    if target['symbol'].lower() not in ('sh000300','000300','000300.sh'):
+        raise ValueError('道氏双指数参考策略目前仅支持沪深300日线')
+    if sh['symbol'].lower() not in ('sh000001','000001.sh') or sz['symbol'].lower() not in ('sz399001','399001.sz'):
+        raise ValueError('请选择上证指数 sh000001 和深证成指 sz399001 日线')
+    return store.put('strategy',dict(id=store.uid('strategy_'),name=p.name,method='dow',run_id=None,
+        dataset_id=target['id'],symbol=target['symbol'],frequency='1d',training_cutoff='',
+        sh_dataset_id=sh['id'],sz_dataset_id=sz['id'],forecast_only=True,created_at=store.now(),
+        synthetic=any(d['synthetic'] for d in refs)))
+
+
+@app.post('/api/v1/strategies/macd')
+def create_macd(p:MACDStrategy):
+    frame,meta=data.load(p.dataset_id)
+    if meta.get('deleted_at'):raise ValueError('数据已删除，请先恢复')
+    if len(frame)<p.slow+p.signal:raise ValueError('行情数据不足以完成 MACD 预热并执行交易')
+    return store.put('strategy',dict(id=store.uid('strategy_'),name=p.name,method='macd',run_id=None,
+        dataset_id=meta['id'],symbol=meta['symbol'],frequency=meta['frequency'],training_cutoff='',
+        parameters=dict(fast=p.fast,slow=p.slow,signal=p.signal),stop_loss=p.stop_loss,
+        created_at=store.now(),synthetic=meta['synthetic']))
 
 
 @app.post('/api/v1/strategies')
@@ -404,10 +540,12 @@ def session_inputs(c):
             raise ValueError('连续合约或教学数据仅支持研究模式；期货账户请上传真实单合约行情')
     if strategy:
         if strategy.get('deleted_at'):raise ValueError('策略已删除，请先恢复或选择其他策略')
+        if strategy.get('forecast_only'):raise ValueError('道氏双指数策略目前仅用于每日预测，不支持回测或模拟交易')
         if strategy['symbol']!=meta['symbol'] or strategy['frequency']!=meta['frequency']:raise ValueError('策略与数据标的或频率不匹配')
-        run=store.get(strategy['run_id']);
-        for key,artifact in run['result']['artifacts'].items():
-            if store.checksum(artifact['path'])!=strategy['artifact_hashes'][key]:raise ValueError('模型产物校验失败')
+        if strategy.get('method')!='macd':
+            run=store.get(strategy['run_id'])
+            for key,artifact in run['result']['artifacts'].items():
+                if store.checksum(artifact['path'])!=strategy['artifact_hashes'][key]:raise ValueError('模型产物校验失败')
         if strategy.get('duration_run_id'):
             duration=store.get(strategy['duration_run_id'],'experiment')
             for key,artifact in duration['result']['artifacts'].items():

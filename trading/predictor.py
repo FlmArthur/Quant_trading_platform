@@ -3,9 +3,17 @@ from backend import store,data
 
 
 class Predictor:
-    def __init__(self,strategy,frame,meta):
+    def __init__(self,strategy,frame,meta,source_overrides=None):
         self.strategy=strategy;self.frame=frame;self.meta=meta
-        self.run=store.get(strategy['run_id'],'experiment');self.c=self.run['config']
+        if strategy.get('method')=='macd':
+            from trading.macd import MACDPredictor
+            self.custom=MACDPredictor(strategy,frame)
+            return
+        self.run=store.get(strategy['run_id'],'experiment');self.c=dict(self.run['config'])
+        if self.c.get('method')=='stgp' and self.c.get('market_dataset_id') and source_overrides:
+            original=store.get(self.c['market_dataset_id'],'dataset')
+            replacement=source_overrides.get(original['symbol'].lower())
+            if replacement:self.c['market_dataset_id']=replacement
         from research.registry import METHODS
         method=METHODS[self.c['method']]
         self.custom=method.predictor_factory(strategy,frame,meta,self.run) if method.predictor_factory else None
